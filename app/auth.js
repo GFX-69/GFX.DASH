@@ -1,133 +1,132 @@
 const express = require('express');
 const passport = require('passport');
-const DiscordStrategy = require('passport-discord');
+const DiscordStrategy = require('passport-discord').Strategy;
 const axios = require('axios');
-const fs = require('fs');
 const randomstring = require("randomstring");
 const router = express.Router();
 
 const { db } = require('../function/db');
-const { logError } = require('../function/logError')
+const { logError } = require('../function/logError');
 
+// HydraPanel Configuration
 const hydrapanel = {
-  url: process.env.PANEL_URL,
+  url: process.env.PANEL_URL?.endsWith('/') 
+    ? process.env.PANEL_URL.slice(0, -1) 
+    : process.env.PANEL_URL,
   key: process.env.PANEL_KEY
 };
 
-// Configure passport to use Discord
+// 1. Passport Discord Strategy Configuration
 passport.use(new DiscordStrategy({
   clientID: process.env.DISCORD_CLIENT_ID,
   clientSecret: process.env.DISCORD_CLIENT_SECRET,
   callbackURL: process.env.DISCORD_CALLBACK_URL,
-  scope: ['identify', 'email']
-}, (accessToken, refreshToken, profile, done) => {
-  return done(null, profile);
+  scope: ['identify', 'email'],
+  passReqToCallback: true
+}, (req, accessToken, refreshToken, profile, done) => {
+  // Convert Discord profile to local user format
+  const user = {
+    id: profile.id,
+    username: profile.username,
+    email: profile.email,
+    avatar: profile.avatar
+  };
+  return done(null, user);
 }));
 
-// Serialize and deserialize user
+// 2. Serialization
 passport.serializeUser((user, done) => {
-  done(null, user);
+  done(null, user.id);
 });
 
-passport.deserializeUser((user, done) => {
-  done(null, user);
-});
-
-// hydrapanel account system
-async function checkAccount(email, username, id) {
+passport.deserializeUser(async (id, done) => {
   try {
-    // Check if user already exists in hydrapanel
-    let response;
-    try {
-      response = await axios.post(`${hydrapanel.url}/api/getUser`, {
-        type: 'email',
-        value: email
-      }, {
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': `${hydrapanel.key}`
-        }
-      });
-    
-      // User already exists, log and return
-      console.log('User already exists in hydrapanel. User ID:', response.data.userId);
-      await db.set(`id-${email}`, response.data.userId);
-      return;
-    } catch (err) {
-      if (err.response) {
-        if (err.response.status === 400) {
-          // User does not exist
-          console.log('User does not exist in hydrapanel');
-          // You can handle actions here like returning an error or creating a new user
-        } else if (err.response.status !== 404) {
-          // Handle other HTTP errors
-          logError('Failed to check user existence in hydrapanel', err);
-          throw err;
-        }
-      } else {
-        // Handle network or other non-response errors
-        logError('Error during request to hydrapanel', err);
-        throw err;
+    const user = await db.get(`user-${id}`);
+    done(null, user || null);
+  } catch (err) {
+    done(err, null);
+  }
+});
+
+// 3. Account Management Functions
+async function handleHydraAccount(email, username, discordId) {
+  try {
+    // Check if user exists
+    const userId = await db.get(`id-${email}`);
+    if (userId) return userId;
+
+    // Create new account
+    const password = randomstring.generate({
+      length: parseInt(process.env.PASSWORD_LENGTH) || 12,
+      charset: 'alphanumeric'
+    });
+
+    const response = await axios.post(`${hydrapanel.url}/api/auth/create-user`, {
+      username,
+      email,
+      password,
+      userId: discordId
+    }, {
+      headers: {
+        'x-api-key': hydrapanel.key,
+        'Content-Type': 'application/json'
       }
-    }    
+    });
 
-    // Generate a random password for new user
-    const password = randomstring.generate({ length: process.env.PASSWORD_LENGTH });
+    // Save credentials
+    await db.set(`id-${email}`, response.data.userId);
+    await db.set(`user-${discordId}`, {
+      id: discordId,
+      email,
+      username,
+      hydraId: response.data.userId
+    });
 
-    // Create user in hydrapanel
-    try {
-      const response = await axios.get(`${hydrapanel.url}/api/auth/create-user`, {
-        params: {
-          username: username,
-          email: email,
-          password: password,
-          userId: id
-        },
-        headers: {
-          'x-api-key': `${hydrapanel.key}`
-        }
-      });
-
-      // Log creation and set password in database
-      await db.set(`password-${email}`, password);
-      await db.set(`id-${email}`, response.data.userId);
-      console.log('User created in HydraPanel');
-    } catch (err) {
-      if (err.response && err.response.status === 409) {
-        console.log('User creation conflict: User already exists in hydrapanel.');
-      } else {
-        logError('Failed to create user in hydrapanel', err);
-        throw err;
-      }
-    }
+    return response.data.userId;
   } catch (error) {
-    logError('Error during account check', error);
+    if (error.response?.status === 409) {
+      // User already exists
+      const existingId = error.response.data.userId;
+      await db.set(`id-${email}`, existingId);
+      return existingId;
+    }
     throw error;
   }
 }
 
-// Discord login route
-router.get('/login/discord', passport.authenticate('discord'));
-
-// Discord callback route
-router.get('/callback/discord', passport.authenticate('discord', {
-  failureRedirect: '/login'
-}), (req, res) => {
-  checkAccount(req.user.email, req.user.username, req.user.id)
-    .then(() => res.redirect(req.session.returnTo || '/dashboard'))
-    .catch(error => {
-      logError('Error during account check', error);
-      res.redirect('/dashboard');
-    });
+// 4. Routes
+router.get('/login/discord', (req, res, next) => {
+  req.session.returnTo = req.query.returnTo || '/dashboard';
+  passport.authenticate('discord')(req, res, next);
 });
 
-// Logout route
-router.get('/logout', (req, res) => {
-  req.logout((err) => {
-    if (err) {
-      logError('Logout failed', err);
-      return res.redirect('/');
+router.get('/callback/discord', 
+  passport.authenticate('discord', { 
+    failureRedirect: '/login?error=discord_auth_failed' 
+  }),
+  async (req, res) => {
+    try {
+      if (!req.user?.email) {
+        throw new Error('No email from Discord');
+      }
+
+      await handleHydraAccount(
+        req.user.email,
+        req.user.username,
+        req.user.id
+      );
+
+      res.redirect(req.session.returnTo || '/dashboard');
+    } catch (error) {
+      logError('Auth callback failed', error);
+      res.redirect('/login?error=account_setup_failed');
     }
+  }
+);
+
+router.get('/logout', (req, res) => {
+  req.logout(() => {
+    req.session.destroy();
     res.redirect('/');
   });
 });
